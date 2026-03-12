@@ -51,8 +51,8 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     if idxs.shape[0] < 4:
         return (img1[0]*255).byte()
 
-    src = pts1[idxs[:,0]]
-    dst = pts2[idxs[:,1]]
+    src = pts2[idxs[:,1]]
+    dst = pts1[idxs[:,0]]
     
     best_H = None
     best_inliers = None
@@ -125,8 +125,17 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     warp1 = K.geometry.warp_perspective(img1, H1.unsqueeze(0), (out_h, out_w))
     warp2 = K.geometry.warp_perspective(img2, H2.unsqueeze(0), (out_h, out_w))
 
-    mask1 = (warp1>0)
-    mask2 = (warp2>0)
+    mask1 = K.geometry.warp_perspective(
+        torch.ones((1, 1, h1, w1), dtype=torch.float32),
+        H1.unsqueeze(0),
+        (out_h, out_w)
+    ) > 0.5
+
+    mask2 = K.geometry.warp_perspective(
+        torch.ones((1, 1, h2, w2), dtype=torch.float32),
+        H2.unsqueeze(0),
+        (out_h, out_w)
+    ) > 0.5
 
     both = mask1 & mask2
     only1 = mask1 & (~mask2)
@@ -134,9 +143,17 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
 
     out = torch.zeros_like(warp1)
 
-    out += warp1 * only1
-    out += warp2 * only2
-    out += (warp1+warp2)/2 * both
+    out += warp1 * only1.float()
+    out += warp2 * only2.float()
+
+    diff = torch.abs(warp1 - warp2).mean(dim=1, keepdim=True)
+
+    agree = both & (diff < 0.08)
+    disagree = both & (diff >= 0.08)
+
+    out += 0.5 * (warp1 + warp2) * agree.float()
+
+    out += warp1 * disagree.float()
 
     out = torch.clamp(out[0]*255,0,255).byte()
 
