@@ -203,12 +203,35 @@ def panorama(imgs: Dict[str, torch.Tensor]):
 
     device = imgs_f[0].device
 
-    sift = K.feature.SIFTFeature(num_features=800)
+    max_side = 0
+    for im in imgs_f:
+        _, h, w = im.shape
+        if max(h, w) > max_side:
+            max_side = max(h, w)
+
+    scale_step = 1
+    if max_side > 1800:
+        scale_step = 8
+    elif max_side > 1200:
+        scale_step = 4
+    elif max_side > 700:
+        scale_step = 2
+
+    proc_imgs = []
+    for im in imgs_f:
+        proc_imgs.append(im[:, ::scale_step, ::scale_step].contiguous())
+
+    if scale_step == 1:
+        sift = K.feature.SIFTFeature(num_features=800)
+    elif scale_step == 2:
+        sift = K.feature.SIFTFeature(num_features=300)
+    else:
+        sift = K.feature.SIFTFeature(num_features=80)
 
     pts_list = []
     desc_list = []
 
-    for im in imgs_f:
+    for im in proc_imgs:
         im_b = im.unsqueeze(0)
         gray = K.color.rgb_to_grayscale(im_b)
         lafs, _, desc = sift(gray)
@@ -249,7 +272,8 @@ def panorama(imgs: Dict[str, torch.Tensor]):
             best_count = 0
             thresh = 4.0
 
-            for _ in range(500):
+            iters = 500 if scale_step == 1 else 120
+            for _ in range(iters):
                 perm = torch.randperm(num_matches, device=device)[:4]
                 src4 = src[perm].unsqueeze(0)
                 dst4 = dst[perm].unsqueeze(0)
@@ -275,7 +299,8 @@ def panorama(imgs: Dict[str, torch.Tensor]):
                     best_inliers = inliers
                     best_H = Hcand
 
-            if best_H is None or best_count < 20:
+            min_inliers = 20 if scale_step == 1 else 12
+            if best_H is None or best_count < min_inliers:
                 continue
 
             Hji = K.geometry.find_homography_dlt(
@@ -335,8 +360,26 @@ def panorama(imgs: Dict[str, torch.Tensor]):
             device=device
         )
 
+        S = torch.tensor(
+            [[1.0 / scale_step, 0.0, 0.0],
+            [0.0, 1.0 / scale_step, 0.0],
+            [0.0, 0.0, 1.0]],
+            dtype=torch.float32,
+            device=device
+        )
+
+        S_inv = torch.tensor(
+            [[float(scale_step), 0.0, 0.0],
+            [0.0, float(scale_step), 0.0],
+            [0.0, 0.0, 1.0]],
+            dtype=torch.float32,
+            device=device
+        )
+
+        H_full = S_inv @ H_to_anchor[i] @ S
+
         warped_corners = K.geometry.transform_points(
-            H_to_anchor[i].unsqueeze(0),
+            H_full.unsqueeze(0),
             corners.unsqueeze(0)
         )[0]
 
@@ -362,14 +405,16 @@ def panorama(imgs: Dict[str, torch.Tensor]):
         device=device
     )
 
-    acc = torch.zeros((1, 3, out_h, out_w), dtype=torch.float32, device=device)
+    pano = torch.zeros((1, 3, out_h, out_w), dtype=torch.float32, device=device)
+    filled = torch.zeros((1, 1, out_h, out_w), dtype=torch.float32, device=device)
     count = torch.zeros((1, 1, out_h, out_w), dtype=torch.float32, device=device)
 
     for i in valid_ids:
         im = imgs_f[i].unsqueeze(0)
         _, _, h, w = im.shape
 
-        Htot = T @ H_to_anchor[i]
+        H_full = S_inv @ H_to_anchor[i] @ S
+        Htot = T @ H_full
 
         warp = K.geometry.warp_perspective(im, Htot.unsqueeze(0), (out_h, out_w))
         mask = K.geometry.warp_perspective(
@@ -380,11 +425,13 @@ def panorama(imgs: Dict[str, torch.Tensor]):
 
         valid = (mask > 0.5).float()
 
-        acc += warp * valid
         count += valid
 
-    pano = acc / torch.clamp(count, min=1.0)
-    pano = pano * (count > 0).float()
+        write_mask = valid * (1.0 - filled)
+        pano += warp * write_mask
+        filled += write_mask
+
+    pano = pano * (filled > 0).float()
 
     img = torch.clamp(pano[0] * 255.0, 0, 255).byte()
 
